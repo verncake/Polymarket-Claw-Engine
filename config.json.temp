@@ -1,0 +1,15 @@
+{
+  "eoa_address": "YOUR_EOA_ADDRESS",
+  "private_key": "YOUR_PRIVATE_KEY",
+  "proxy_wallet": "YOUR_PROXY_WALLET",
+  "builder_key": {
+    "api_key": "YOUR_API_KEY",
+    "api_secret": "YOUR_API_SECRET",
+    "passphrase": "YOUR_PASSPHRASE"
+  },
+  "clob_api_build_key": {
+    "api_key": "YOUR_CLOB_API_KEY",
+    "api_secret": "YOUR_CLOB_API_SECRET",
+    "api_passphrase": "YOUR_CLOB_API_PASSPHRASE"
+  }
+}
