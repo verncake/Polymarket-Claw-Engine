@@ -1,17 +1,18 @@
 import requests
-import logging
 
 class DataAPI:
     BASE_URL = "https://data-api.polymarket.com"
     
-    def get_positions(self, user_address):
-        # 用户持仓查询
-        resp = requests.get(f"{self.BASE_URL}/positions", params={"user": user_address, "sizeThreshold": 0})
+    @staticmethod
+    def get_positions(user_address, size_threshold=0):
+        # Query user positions
+        resp = requests.get(f"{DataAPI.BASE_URL}/positions", params={"user": user_address, "sizeThreshold": size_threshold})
         resp.raise_for_status()
         return resp.json()
 
-    def get_closed_positions(self, user_address):
-        # 已平仓记录
-        resp = requests.get(f"{self.BASE_URL}/closed-positions", params={"user": user_address})
+    @staticmethod
+    def get_closed_positions(user_address):
+        # Get records of closed positions
+        resp = requests.get(f"{DataAPI.BASE_URL}/closed-positions", params={"user": user_address})
         resp.raise_for_status()
         return resp.json()
