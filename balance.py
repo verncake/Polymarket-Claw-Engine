@@ -1,11 +1,15 @@
 """
 Polymarket 账户盈亏实时监控
 ==============================
-查询真实账户状态：
-  - Gnosis Safe USDC 余额（通过 Polygon RPC，erc-20 balanceOf）
-  - CLOB 锁定余额
-  - 已实现 / 未实现 PnL
-  - 交易胜率统计
+支持两种余额查询模式：
+  Mode 1 - Direct Chain:  通过 Polygon RPC + eth_call 直接查链上 USDC 合约
+  Mode 2 - SDK / CLOB API:  通过 ClobClient.getBalanceAllowance 查 Polymarket 平台账户余额
+
+两种模式的区别：
+  | 模式         | 数据来源                       | 能看到的信息               |
+  |-------------|------------------------------|--------------------------|
+  | Direct Chain | Polygon RPC (无需认证)         | 钱包真实 USDC 余额        |
+  | SDK / CLOB  | clob.polymarket.com (签名认证) | 平台账户、挂单冻结、保证金 |
 """
 import json
 import os
@@ -26,10 +30,15 @@ def to_usdc_hex(address: str) -> str:
     return address.lower().replace("0x", "").zfill(64)
 
 
-def get_gnosis_usdc_balance(address: str) -> float:
+# ══════════════════════════════════════════════════════════════════════
+# Mode 1: Direct Chain Query（无需签名，直接读链）
+# ══════════════════════════════════════════════════════════════════════
+
+def get_chain_balance(address: str) -> float:
     """
-    通过 Polygon RPC + eth_call 查询 Gnosis Safe 代理钱包的 USDC 余额。
-    不需要私钥签名，直接查链上合约存储。
+    Mode 1 - Direct Chain Query
+    通过 Polygon RPC + eth_call 直接查询链上 USDC 合约余额。
+    无需签名认证，返回钱包真实持有的 USDC 数量。
     """
     payload = {
         "jsonrpc": "2.0",
@@ -43,27 +52,50 @@ def get_gnosis_usdc_balance(address: str) -> float:
     resp = requests.post(POLYGON_RPC, json=payload, timeout=15)
     resp.raise_for_status()
     result = resp.json().get("result", "0x0")
-    # 返回的值是 16 进制，USDC 精度 1e6
     balance_wei = int(result, 16)
     return balance_wei / 1_000_000
 
 
-def get_clob_locked_balance() -> float:
+# ══════════════════════════════════════════════════════════════════════
+# Mode 2: SDK / CLOB API Query（签名认证，查平台账户）
+# ══════════════════════════════════════════════════════════════════════
+
+def get_clob_account_balance() -> dict:
     """
-    通过 CLOB SDK 查询 CLOB 合约内锁定的 USDC 余额。
-    （不等于 Gnosis Safe 总余额）
+    Mode 2 - SDK / CLOB API Query
+    通过 ClobClient.getBalanceAllowance(AssetType.COLLATERAL)
+    查询 Polymarket 平台账户的 USDC 余额（含挂单冻结、保证金等）。
+
+    返回: {
+        "balance": float,       # 账户余额（USDC）
+        "allowance": float,     # 已授权额度
+        "raw": dict             # SDK 原始返回
+    }
     """
     try:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         raw = client.sdk.get_balance_allowance(params)
-        return int(raw.get("balance", 0)) / 1_000_000
+        balance = int(raw.get("balance", 0)) / 1_000_000
+        allowance = int(raw.get("allowance", 0)) / 1_000_000
+        return {"balance": balance, "allowance": allowance, "raw": raw}
     except Exception as e:
+        return {"balance": -1.0, "allowance": -1.0, "error": str(e)}
+
+
+def get_data_api_positions_value() -> float:
+    """通过 Data API 查询当前持仓总价值"""
+    try:
+        return client.data.get_positions_value()
+    except Exception:
         return -1.0
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 仓位与统计
+# ══════════════════════════════════════════════════════════════════════
+
 def get_open_positions():
-    """获取当前开放仓位"""
     try:
         return client.data.get_positions()
     except Exception:
@@ -71,9 +103,15 @@ def get_open_positions():
 
 
 def get_closed_positions():
-    """获取已结算仓位"""
     try:
         return client.data.get_closed_positions()
+    except Exception:
+        return []
+
+
+def get_all_trades():
+    try:
+        return client.data.get_trades()
     except Exception:
         return []
 
@@ -81,80 +119,81 @@ def get_closed_positions():
 def calc_win_rate(closed_positions, open_positions):
     """
     计算胜率：
-    - 已结算仓位：PnL > 0 为赢，PnL < 0 为输
-    - 开放仓位：浮盈 > 0 为赢，浮亏 < 0 为输
+    - 已结算仓位：realizedPnl > 0 为赢
+    - 开放仓位：percentPnl > 0 为赢
     """
     wins, total = 0, 0
 
-    # 已结算
     for p in closed_positions:
         pnl = float(p.get("realizedPnl", 0))
-        if pnl > 0:
-            wins += 1
         if pnl != 0:
             total += 1
+            if pnl > 0:
+                wins += 1
 
-    # 开放仓位
     for p in open_positions:
         pnl_pct = float(p.get("percentPnl", 0))
-        if pnl_pct > 0:
-            wins += 1
         if pnl_pct != 0:
             total += 1
+            if pnl_pct > 0:
+                wins += 1
 
     return (wins / total * 100) if total > 0 else 0.0, wins, total
 
 
-def get_all_trades():
-    """获取所有历史成交（用于统计总交易笔数）"""
-    try:
-        return client.data.get_trades()
-    except Exception:
-        return []
-
+# ══════════════════════════════════════════════════════════════════════
+# 主输出
+# ══════════════════════════════════════════════════════════════════════
 
 def print_banner():
-    print("=" * 60)
-    print("  Polymarket 账户盈亏实时监控")
-    print("=" * 60)
+    print("=" * 62)
+    print("  Polymarket 账户盈亏实时监控 (双模式)")
+    print("=" * 62)
 
 
 def main():
     print_banner()
     print(f"\nProxy: {client.proxy_wallet}\n")
 
-    # ── 1. Gnosis Safe USDC 总余额（通过 Polygon RPC）──────────
-    gnosis_usdc = get_gnosis_usdc_balance(client.proxy_wallet)
-    print(f"[链上] Gnosis Safe USDC 余额: {gnosis_usdc:.6f} USDC")
+    # ── Mode 1: Direct Chain ──────────────────────────────────
+    chain_balance = get_chain_balance(client.proxy_wallet)
+    print(f"[Mode 1 - Direct Chain]")
+    print(f"  RPC:        {POLYGON_RPC}")
+    print(f"  Contract:   {USDC_CONTRACT}")
+    print(f"  USDC 余额:  {chain_balance:.6f} USDC  (链上合约实时)\n")
 
-    # ── 2. CLOB 锁定余额 ───────────────────────────────────────
-    clob_locked = get_clob_locked_balance()
-    if clob_locked >= 0:
-        print(f"[CLOB] CLOB 合约锁定 USDC:  {clob_locked:.6f} USDC")
+    # ── Mode 2: SDK / CLOB API ──────────────────────────────
+    clob_info = get_clob_account_balance()
+    if "error" not in clob_info:
+        print(f"[Mode 2 - SDK / CLOB API]")
+        print(f"  Endpoint:   clob.polymarket.com (L2 签名认证)")
+        print(f"  USDC 余额:  {clob_info['balance']:.6f} USDC  (平台账户)")
+        print(f"  授权额度:   {clob_info['allowance']:.6f} USDC\n")
     else:
-        print(f"[CLOB] CLOB 锁定余额查询失败")
+        print(f"[Mode 2 - SDK / CLOB API]  查询失败: {clob_info['error']}\n")
 
-    # ── 3. 账户摘要 ────────────────────────────────────────────
+    # ── 平台账户摘要 ─────────────────────────────────────────
     summary = client.get_account_summary()
-    print(f"\n[账户摘要]")
-    print(f"  开放订单数:     {summary.get('open_orders', 0)}")
+    print(f"[账户摘要]")
+    print(f"  开放订单数:   {summary.get('open_orders', 0)}")
 
-    # ── 4. 仓位与 PnL ─────────────────────────────────────────
+    # ── 仓位与 PnL ──────────────────────────────────────────
     closed_positions = get_closed_positions()
     open_positions = get_open_positions()
     trades = get_all_trades()
 
     print(f"\n[仓位]")
-    print(f"  开放仓位:       {len(open_positions)} 笔")
+    print(f"  开放仓位:     {len(open_positions)} 笔")
     for p in open_positions:
-        title = p.get("title", "Unknown")[:50]
+        title = p.get("title", "Unknown")[:52]
         size = p.get("size", 0)
         pnl_pct = p.get("percentPnl", 0)
-        print(f"    - {title} | size={size} | pnl%={pnl_pct:.2f}%")
+        val = p.get("currentValue", 0)
+        print(f"    - {title}")
+        print(f"      size={size} | pnl%={pnl_pct:.2f}% | value=${val:.4f}")
 
-    print(f"  已结算仓位:     {len(closed_positions)} 笔")
+    print(f"  已结算仓位:   {len(closed_positions)} 笔")
 
-    # ── 5. PnL 统计 ───────────────────────────────────────────
     realized_pnl = sum(float(p.get("realizedPnl", 0)) for p in closed_positions)
     unrealized_pnl = sum(
         float(p.get("size", 0)) * float(p.get("percentPnl", 0)) / 100
@@ -162,23 +201,15 @@ def main():
     )
 
     print(f"\n[PnL]")
-    print(f"  已实现 PnL:     +${realized_pnl:.6f}")
-    print(f"  浮动 PnL:       ${unrealized_pnl:.6f}")
-    print(f"  总 PnL:         ${(realized_pnl + unrealized_pnl):.6f}")
+    print(f"  已实现 PnL:   +${realized_pnl:.6f}")
+    print(f"  浮动 PnL:     ${unrealized_pnl:.6f}")
+    print(f"  总 PnL:       ${(realized_pnl + unrealized_pnl):.6f}")
 
-    # ── 6. 胜率统计 ───────────────────────────────────────────
+    # ── 胜率统计 ─────────────────────────────────────────────
     win_rate, wins, total = calc_win_rate(closed_positions, open_positions)
     print(f"\n[胜率统计]")
-    print(f"  总交易笔数:     {len(trades)} 笔")
-    print(f"  已结算:         {len(closed_positions)} 笔 | 赢: {wins} / {total} (胜率 {win_rate:.2f}%)")
-
-    # ── 7. 综合余额 ───────────────────────────────────────────
-    # 已实现 PnL 已累积在 gnosis_usdc 中（不是独立新增的资金）
-    net_assets = gnosis_usdc + unrealized_pnl
-    print(f"\n[综合账户]")
-    print(f"  Gnosis Safe USDC: {gnosis_usdc:.6f} USDC  (含历史利润)")
-    print(f"  浮动盈亏:         {unrealized_pnl:.6f} USDC")
-    print(f"  ≈ 净资产:         {net_assets:.6f} USDC")
+    print(f"  总成交笔数:   {len(trades)} 笔")
+    print(f"  已结算:       {len(closed_positions)} 笔 | 赢: {wins}/{total} | 胜率: {win_rate:.2f}%")
 
 
 if __name__ == "__main__":
