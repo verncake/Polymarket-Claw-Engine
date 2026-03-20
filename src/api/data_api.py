@@ -1,9 +1,10 @@
 import os
 import requests
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
-class GammaClient:
-    def __init__(self, base_url: str = "https://gamma-api.polymarket.com"):
+class DataAPI:
+    def __init__(self, proxy_wallet: str, base_url: str = "https://data-api.polymarket.com"):
+        self.proxy_wallet = proxy_wallet
         self.base_url = base_url
 
     def get_markets(self, active: bool = True, closed: bool = False, limit: int = 10) -> Any:
@@ -21,10 +22,27 @@ class GammaClient:
         response.raise_for_status()
         return response.json()
 
-if __name__ == "__main__":
-    client = GammaClient()
-    try:
-        markets = client.get_markets(limit=1)
-        print(f"Successfully fetched market: {markets[0]['question']}")
-    except Exception as e:
-        print(f"Error: {e}")
+    def get_trades(self, user: str = None) -> Any:
+        user = user or self.proxy_wallet
+        response = requests.get(f"{self.base_url}/trades?user={user}", timeout=5)
+        response.raise_for_status()
+        return response.json()
+
+    def get_positions_value(self, user: str = None) -> float:
+        user = user or self.proxy_wallet
+        response = requests.get(f"{self.base_url}/value?user={user}", timeout=5)
+        response.raise_for_status()
+        value_data = response.json()
+        return value_data[0]['value'] if value_data and len(value_data) > 0 else 0.0
+
+    def get_closed_positions(self, user: str = None) -> Any:
+        user = user or self.proxy_wallet
+        response = requests.get(f"{self.base_url}/closed-positions?user={user}", timeout=5)
+        response.raise_for_status()
+        return response.json()
+
+    def get_positions(self, user: str = None) -> Any:
+        user = user or self.proxy_wallet
+        response = requests.get(f"{self.base_url}/positions?user={user}&sizeThreshold=0", timeout=5)
+        response.raise_for_status()
+        return response.json()

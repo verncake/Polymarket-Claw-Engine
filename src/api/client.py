@@ -2,21 +2,16 @@ import os
 import json
 import logging
 import requests
+import traceback
 from typing import Dict, Any
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, ApiCreds
 from scrapling.fetchers import Fetcher
 from markdownify import markdownify as md
 from src.api.clob_api import CLOBAPI
 from src.api.data_api import DataAPI
 
 logging.basicConfig(level=logging.INFO)
-
-class Credentials:
-    def __init__(self, key, secret, passphrase):
-        self.api_key = key
-        self.api_secret = secret
-        self.api_passphrase = passphrase
 
 class PolymarketClient:
     def __init__(self, config_path="config.json"):
@@ -30,25 +25,34 @@ class PolymarketClient:
         with open(config_full_path, 'r') as f:
             self.config = json.load(f)
 
-        # Direct access
-        self.private_key = self.config['private_key']
-        self.api_key = self.config['clob_api_build_key']['api_key']
-        self.api_secret = self.config['clob_api_build_key']['api_secret']
-        self.passphrase = self.config['clob_api_build_key']['api_passphrase']
-        self.proxy_wallet = self.config['proxy_wallet']
+        # Helper for Env > Config fallback
+        def _get_val(env_var, config_path_list):
+            val = os.getenv(env_var)
+            if val: return val
+            
+            temp = self.config
+            for k in config_path_list:
+                temp = temp.get(k, {})
+            if isinstance(temp, str): return temp
+            raise ValueError(f"Missing mandatory credential: {env_var} or {config_path_list}")
 
-        # Initialize SDK with positional arguments
+        self.private_key = _get_val('POLYCLAW_PRIVATE_KEY', ['private_key'])
+        self.api_key = _get_val('CLOB_API_KEY', ['clob_api_build_key', 'api_key'])
+        self.api_secret = _get_val('CLOB_API_SECRET', ['clob_api_build_key', 'api_secret'])
+        self.passphrase = _get_val('CLOB_API_PASSPHRASE', ['clob_api_build_key', 'api_passphrase'])
+        self.proxy_wallet = _get_val('PROXY_WALLET', ['proxy_wallet'])
+
         self.sdk = ClobClient(
             "https://clob.polymarket.com",
             137,
             self.private_key,
-            Credentials(self.api_key, self.api_secret, self.passphrase),
+            ApiCreds(self.api_key, self.api_secret, self.passphrase),
             1, # signature_type
             self.proxy_wallet
         )
 
         self.clob = CLOBAPI(self.api_key, self.api_secret, self.passphrase)
-        self.data = DataAPI()
+        self.data = DataAPI(self.proxy_wallet)
 
     # ... (rest of methods)
     def fetch_orderbook(self, token_id: str) -> Dict[str, Any]:
@@ -88,21 +92,15 @@ class PolymarketClient:
             usdc_balance = int(collateral['balance']) / 1e6
             
             # Open Orders
-            # Assuming get_orders returns all orders, filter them
             all_orders = self.sdk.get_orders()
             open_orders = [o for o in all_orders if o.get('status') == 'OPEN']
             
             # Position Value
-            val_resp = requests.get(f"https://data-api.polymarket.com/value?user={self.proxy_wallet}", timeout=5)
-            val_resp.raise_for_status()
-            value_data = val_resp.json()
-            position_value = value_data[0]['value'] if value_data else 0
+            position_value = self.data.get_positions_value()
             
             # Realized Pnl
-            closed_resp = requests.get(f"https://data-api.polymarket.com/closed-positions?user={self.proxy_wallet}", timeout=5)
-            closed_resp.raise_for_status()
-            closed_pos = closed_resp.json()
-            realized_pnl = sum(p.get('realizedPnl', 0) for p in closed_pos)
+            closed_pos = self.data.get_closed_positions()
+            realized_pnl = sum(float(p.get('realizedPnl', 0)) for p in closed_pos)
             
             return {
                 "usdc_balance": usdc_balance,
@@ -111,6 +109,5 @@ class PolymarketClient:
                 "realized_pnl": realized_pnl
             }
         except Exception as e:
-            import traceback
             logging.error(f"Account summary fetch failed: {e}\n{traceback.format_exc()}")
             return {"error": str(e)}
