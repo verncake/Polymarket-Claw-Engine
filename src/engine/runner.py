@@ -4,15 +4,17 @@ Strategy Runner
 定时调度器，负责加载配置、驱动各个策略的 on_tick 循环，
 并将交易指令提交给 Executor 执行。
 """
+import argparse
+import json
 import logging
+import os
 import threading
 import time
-import json
-import os
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 from src.api.client import PolymarketClient
 from src.engine.executor import Executor
+from src.strategies.base import BaseStrategy
 from src.strategies.btc_5m import BTC5MStrategy
 from src.strategies.gabagool import GabagoolStrategy
 
@@ -24,12 +26,19 @@ logging.basicConfig(
 logger = logging.getLogger("engine.runner")
 
 
+STRATEGY_MAP = {
+    "btc_5m": BTC5MStrategy,
+    "gabagool": GabagoolStrategy,
+}
+
+
 class StrategyRunner:
     """
     策略运行器：
     - 加载 config.json 中的策略配置
     - 每 tick_interval 秒调度所有策略的 on_tick
     - 将返回的交易指令路由至 Executor 执行
+    - 在订单成交后回调策略的 on_fill 方法
     """
 
     def __init__(self, config_path: str = "config.json", tick_interval: int = 300):
@@ -41,7 +50,7 @@ class StrategyRunner:
         self.tick_interval = tick_interval
         self.client = PolymarketClient(config_path)
         self.executor = Executor(config_path)
-        self.strategies: Dict[str, Any] = {}
+        self.strategies: Dict[str, BaseStrategy] = {}
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -61,34 +70,51 @@ class StrategyRunner:
             if not cfg.get("enabled", False):
                 continue
 
-            try:
-                if name == "btc_5m":
-                    strat = BTC5MStrategy(client=self.client, config=cfg)
-                elif name == "gabagool":
-                    strat = GabagoolStrategy(client=self.client, config=cfg)
-                else:
-                    logger.warning(f"Unknown strategy: {name}, skipping.")
-                    continue
+            if name not in STRATEGY_MAP:
+                logger.warning(f"Unknown strategy: '{name}', skipping.")
+                continue
 
+            try:
+                strat_class = STRATEGY_MAP[name]
+                strat = strat_class(client=self.client, config=cfg)
                 strat.init()
                 self.strategies[name] = strat
                 logger.info(f"Strategy '{name}' loaded and initialized.")
-
             except Exception as e:
                 logger.error(f"Failed to load strategy '{name}': {e}")
 
     def _fetch_market_data(self) -> Dict[str, Any]:
         """
         从 PolymarketClient 获取当前市场数据。
-        目前返回模拟数据，实际实现应调用真实的市场行情接口。
+        返回包含价格信息的数据字典，格式与各策略 on_tick 期望一致。
         """
         try:
-            # TODO: 接入真实市场数据源（orderbook / trade feeds）
-            balance = self.client.get_balance()
-            return {
+            # 1. 账户余额（用于参考）
+            summary = self.client.get_account_summary()
+
+            # 2. 开放仓位
+            positions = self.client.data.get_positions()
+
+            # 3. 构造统一的市场数据格式
+            # 包含公共价格信息（从开放仓位中提取）
+            market_data = {
                 "timestamp": int(time.time()),
-                "balance": balance,
+                "balance": summary.get("usdc_balance", 0),
+                "open_orders": summary.get("open_orders", 0),
+                "positions": positions,
             }
+
+            # 如果有开放仓位，提取第一个的价格作为参考
+            if positions:
+                first = positions[0]
+                market_data["price"] = float(first.get("avgPrice", 0))
+                market_data["yes_price"] = float(first.get("avgPrice", 0))
+                market_data["no_price"] = 1.0 - market_data["yes_price"]
+                market_data["current_value"] = float(first.get("currentValue", 0))
+                market_data["size"] = float(first.get("size", 0))
+
+            return market_data
+
         except Exception as e:
             logger.error(f"Failed to fetch market data: {e}")
             return {"error": str(e)}
@@ -106,33 +132,35 @@ class StrategyRunner:
             try:
                 signal = strat.on_tick(market_data)
                 if signal:
-                    self._execute_signal(name, signal)
+                    self._execute_signal(name, strat, signal)
             except Exception as e:
                 logger.exception(f"Strategy '{name}' error in on_tick: {e}")
 
         logger.info("=== Tick complete ===")
 
-    def _execute_signal(self, strategy_name: str, signal: Dict[str, Any]) -> None:
-        """将策略信号提交给 Executor 执行"""
+    def _execute_signal(
+        self, strategy_name: str, strat: BaseStrategy, signal: Dict[str, Any]
+    ) -> None:
+        """将策略信号提交给 Executor 执行，并在成交后回调 on_fill"""
         action = signal.get("action")
 
         if action == "batch":
-            # 批量订单
             for order in signal.get("orders", []):
-                self._execute_single(strategy_name, order)
+                self._execute_single(strategy_name, strat, order)
         else:
-            self._execute_single(strategy_name, signal)
+            self._execute_single(strategy_name, strat, signal)
 
-    def _execute_single(self, strategy_name: str, order: Dict[str, Any]) -> None:
-        """执行单个订单"""
-        action = order.get("action")
+    def _execute_single(
+        self, strategy_name: str, strat: BaseStrategy, order: Dict[str, Any]
+    ) -> None:
+        """执行单个订单，成交后回调策略的 on_fill"""
         token_id = order.get("token_id")
+        action = order.get("action")
         price = order.get("price")
         size = order.get("size")
 
         logger.info(
-            f"[{strategy_name}] Executing: {action} {size} @ {price} "
-            f"(token={token_id})"
+            f"[{strategy_name}] Executing: {action} {size} @ {price} (token={token_id})"
         )
 
         try:
@@ -144,10 +172,22 @@ class StrategyRunner:
             )
             logger.info(f"[{strategy_name}] Execution result: {result}")
 
-            # 同步更新策略持仓
+            # 只有在确认成功后才回调 on_fill
             if result.get("status") == "success":
-                delta = size if action == "buy" else -size
-                self.strategies[strategy_name].update_position(delta)
+                fill_event = {
+                    "side": action,
+                    "price": price,
+                    "size": size,
+                    "order_id": result.get("order_id"),
+                }
+                # 同步更新基类持仓
+                cost = -price * size if action == "buy" else price * size
+                strat.update_position(
+                    delta=size if action == "buy" else -size,
+                    cost=cost,
+                )
+                # 回调策略的 on_fill
+                strat.on_fill(fill_event)
 
         except Exception as e:
             logger.error(f"[{strategy_name}] Execution failed: {e}")
@@ -194,14 +234,22 @@ class StrategyRunner:
 
 
 if __name__ == "__main__":
-    import sys
+    parser = argparse.ArgumentParser(description="Polymarket Strategy Runner")
+    parser.add_argument(
+        "--config", default="config.json", help="Path to config file."
+    )
+    parser.add_argument(
+        "--interval", type=int, default=300, help="Tick interval in seconds."
+    )
+    parser.add_argument(
+        "--once", action="store_true", help="Run once and exit."
+    )
 
-    config = sys.argv[1] if len(sys.argv) > 1 else "config.json"
-    interval = int(sys.argv[2]) if len(sys.argv) > 2 else 300
+    args = parser.parse_args()
 
-    runner = StrategyRunner(config_path=config, tick_interval=interval)
+    runner = StrategyRunner(config_path=args.config, tick_interval=args.interval)
 
-    if "--once" in sys.argv:
+    if args.once:
         runner.run_once()
     else:
         try:

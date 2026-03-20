@@ -12,13 +12,17 @@ Polymarket 账户盈亏实时监控
   | SDK / CLOB  | clob.polymarket.com (签名认证) | 平台账户、挂单冻结、保证金 |
 """
 import json
+import logging
 import os
 import requests
 from src.api.client import PolymarketClient
 
+logger = logging.getLogger("balance")
+
 # Polygon RPC 节点（无 API Key 公共端）
 POLYGON_RPC = "https://rpc-mainnet.matic.quiknode.pro"
 USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_DIVISOR = 1_000_000
 
 # 加载配置
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
@@ -53,7 +57,7 @@ def get_chain_balance(address: str) -> float:
     resp.raise_for_status()
     result = resp.json().get("result", "0x0")
     balance_wei = int(result, 16)
-    return balance_wei / 1_000_000
+    return balance_wei / USDC_DIVISOR
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -76,11 +80,12 @@ def get_clob_account_balance() -> dict:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         raw = client.sdk.get_balance_allowance(params)
-        balance = int(raw.get("balance", 0)) / 1_000_000
-        allowance = int(raw.get("allowance", 0)) / 1_000_000
+        balance = int(raw.get("balance", 0)) / USDC_DIVISOR
+        allowance = int(raw.get("allowance", 0)) / USDC_DIVISOR
         return {"balance": balance, "allowance": allowance, "raw": raw}
     except Exception as e:
-        return {"balance": -1.0, "allowance": -1.0, "error": str(e)}
+        logger.error(f"[Mode 2] SDK query failed: {e}")
+        return {"balance": None, "allowance": None, "error": str(e)}
 
 
 def get_data_api_positions_value() -> float:
@@ -98,21 +103,24 @@ def get_data_api_positions_value() -> float:
 def get_open_positions():
     try:
         return client.data.get_positions()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to get open positions: {e}")
         return []
 
 
 def get_closed_positions():
     try:
         return client.data.get_closed_positions()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to get closed positions: {e}")
         return []
 
 
 def get_all_trades():
     try:
         return client.data.get_trades()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to get trades: {e}")
         return []
 
 
@@ -195,10 +203,7 @@ def main():
     print(f"  已结算仓位:   {len(closed_positions)} 笔")
 
     realized_pnl = sum(float(p.get("realizedPnl", 0)) for p in closed_positions)
-    unrealized_pnl = sum(
-        float(p.get("size", 0)) * float(p.get("percentPnl", 0)) / 100
-        for p in open_positions
-    )
+    unrealized_pnl = summary.get("position_value", 0.0)
 
     print(f"\n[PnL]")
     print(f"  已实现 PnL:   +${realized_pnl:.6f}")
