@@ -2,3 +2,7 @@ config.json
 state/
 logs/
 .env
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
